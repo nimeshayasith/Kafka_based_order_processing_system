@@ -1,5 +1,8 @@
 """Small CLI to inspect the contents of the 'orders-dlq' topic."""
+import functools
 import os
+
+print = functools.partial(print, flush=True)
 
 from confluent_kafka import DeserializingConsumer
 from confluent_kafka.schema_registry import SchemaRegistryClient

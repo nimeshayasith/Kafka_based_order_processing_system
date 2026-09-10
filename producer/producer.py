@@ -1,8 +1,11 @@
 """Producer: publishes random Order messages (Avro) to the 'orders' topic."""
 import argparse
+import functools
 import os
 import random
 import time
+
+print = functools.partial(print, flush=True)
 
 from confluent_kafka import SerializingProducer
 from confluent_kafka.schema_registry import SchemaRegistryClient

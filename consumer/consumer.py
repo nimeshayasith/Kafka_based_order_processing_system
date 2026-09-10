@@ -8,9 +8,12 @@ a specific failure path on command):
                             succeeds within the retry budget.
   FORCE_PERMANENT_FAIL  -> always fails, exhausts retries, lands in DLQ.
 """
+import functools
 import os
 import random
 import time
+
+print = functools.partial(print, flush=True)
 
 from confluent_kafka import DeserializingConsumer, SerializingProducer
 from confluent_kafka.schema_registry import SchemaRegistryClient

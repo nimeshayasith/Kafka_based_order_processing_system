@@ -66,7 +66,14 @@ def orders_watch_loop():
     consumer = build_schema_consumer("order.avsc", f"dashboard-orders-{int(time.time())}")
     consumer.subscribe([ORDERS_TOPIC])
     while True:
-        msg = consumer.poll(1.0)
+        try:
+            msg = consumer.poll(1.0)
+        except Exception as e:
+            # Topic may not exist yet (created lazily by the producer) --
+            # keep retrying instead of letting the watcher thread die.
+            print(f"[dashboard] orders watch error, retrying: {e}")
+            time.sleep(2)
+            continue
         if msg is None or msg.error():
             continue
         order = msg.value()
@@ -89,7 +96,12 @@ def dlq_watch_loop():
     consumer = build_schema_consumer("order_dlq.avsc", f"dashboard-dlq-{int(time.time())}")
     consumer.subscribe([DLQ_TOPIC])
     while True:
-        msg = consumer.poll(1.0)
+        try:
+            msg = consumer.poll(1.0)
+        except Exception as e:
+            print(f"[dashboard] DLQ watch error, retrying: {e}")
+            time.sleep(2)
+            continue
         if msg is None or msg.error():
             continue
         rec = msg.value()

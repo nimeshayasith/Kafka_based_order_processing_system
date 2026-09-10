@@ -82,7 +82,22 @@ The consumer also randomly simulates transient failures on ordinary orders
 (~10% of attempts, configurable via `CONSUMER_RANDOM_FAILURE_RATE`) so
 retry behavior is visible even without the explicit triggers.
 
-## 6. Inspect the DLQ
+## 6. Live demo dashboard (optional)
+
+With the consumer already running, start the dashboard in another terminal:
+
+```
+python dashboard/dashboard.py
+```
+
+Open [http://localhost:5000](http://localhost:5000) — it shows the running
+average (with a sparkline), a live order feed, and DLQ entries, all updating
+every second. Use the on-page buttons to fire the transient/permanent
+failure triggers instead of the CLI, for a live demo without switching
+terminals. The dashboard consumes with its own consumer groups, so it never
+interferes with `consumer.py`'s offsets.
+
+## 7. Inspect the DLQ
 
 ```
 python dlq_viewer/dlq_viewer.py
@@ -110,6 +125,7 @@ Environment variables (all optional, defaults shown):
 /producer/force_failure.py  # demo helper: force a transient/permanent failure
 /consumer/consumer.py       # running average + retry/backoff + DLQ routing
 /dlq_viewer/dlq_viewer.py   # CLI to inspect 'orders-dlq'
+/dashboard/dashboard.py     # live web UI: running avg, order feed, DLQ, demo trigger buttons
 /schemas/order.avsc         # Avro schema for Order
 /schemas/order_dlq.avsc     # Avro schema for DLQ records (Order + failure metadata)
 docker-compose.yml          # Kafka (KRaft) + Schema Registry

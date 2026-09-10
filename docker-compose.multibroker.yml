@@ -1,0 +1,135 @@
+x-kafka-common: &kafka-common
+  image: confluentinc/cp-kafka:7.6.1
+  environment: &kafka-common-env
+    KAFKA_CONTROLLER_QUORUM_VOTERS: 1@controller:29093
+    KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+    KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+    KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+    KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+    KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+    KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+    CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+
+services:
+  # A single dedicated KRaft controller (metadata quorum of one -- no
+  # multi-node Raft election to manage) plus three broker-only nodes.
+  # This keeps cluster formation simple/stable while still giving the
+  # demo three real brokers to show partition leadership and replication
+  # across, matching a standard Kafka cluster diagram.
+  controller:
+    <<: *kafka-common
+    hostname: controller
+    container_name: controller
+    environment:
+      <<: *kafka-common-env
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: controller
+      KAFKA_LISTENERS: CONTROLLER://controller:29093
+      # Controller-only nodes don't serve client traffic, so they need no
+      # advertised (client-facing) listener.
+
+  broker1:
+    <<: *kafka-common
+    hostname: broker1
+    container_name: broker1
+    depends_on:
+      - controller
+    ports:
+      - "9092:9092"
+    environment:
+      <<: *kafka-common-env
+      KAFKA_NODE_ID: 2
+      KAFKA_PROCESS_ROLES: broker
+      KAFKA_LISTENERS: PLAINTEXT://broker1:29092,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://broker1:29092,PLAINTEXT_HOST://localhost:9092
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+
+  broker2:
+    <<: *kafka-common
+    hostname: broker2
+    container_name: broker2
+    depends_on:
+      - controller
+    ports:
+      - "9093:9093"
+    environment:
+      <<: *kafka-common-env
+      KAFKA_NODE_ID: 3
+      KAFKA_PROCESS_ROLES: broker
+      KAFKA_LISTENERS: PLAINTEXT://broker2:29092,PLAINTEXT_HOST://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://broker2:29092,PLAINTEXT_HOST://localhost:9093
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9093"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+
+  broker3:
+    <<: *kafka-common
+    hostname: broker3
+    container_name: broker3
+    depends_on:
+      - controller
+    ports:
+      - "9094:9094"
+    environment:
+      <<: *kafka-common-env
+      KAFKA_NODE_ID: 4
+      KAFKA_PROCESS_ROLES: broker
+      KAFKA_LISTENERS: PLAINTEXT://broker3:29092,PLAINTEXT_HOST://0.0.0.0:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://broker3:29092,PLAINTEXT_HOST://localhost:9094
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9094"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.6.1
+    hostname: schema-registry
+    container_name: schema-registry
+    depends_on:
+      broker1:
+        condition: service_healthy
+      broker2:
+        condition: service_healthy
+      broker3:
+        condition: service_healthy
+    ports:
+      - "8081:8081"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: PLAINTEXT://broker1:29092,PLAINTEXT://broker2:29092,PLAINTEXT://broker3:29092
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/subjects"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  # One-shot job: creates 'orders' and 'orders-dlq' with 3 partitions and
+  # replication factor 3, then exits. Re-run with `docker compose up kafka-init`
+  # if you ever need to recreate the topics.
+  kafka-init:
+    image: confluentinc/cp-kafka:7.6.1
+    depends_on:
+      broker1:
+        condition: service_healthy
+      broker2:
+        condition: service_healthy
+      broker3:
+        condition: service_healthy
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+        kafka-topics --bootstrap-server broker1:29092 --create --if-not-exists \
+          --topic orders --partitions 3 --replication-factor 3
+        kafka-topics --bootstrap-server broker1:29092 --create --if-not-exists \
+          --topic orders-dlq --partitions 3 --replication-factor 3
+        echo "Topics ready:"
+        kafka-topics --bootstrap-server broker1:29092 --describe

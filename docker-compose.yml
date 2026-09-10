@@ -44,3 +44,22 @@ services:
       interval: 10s
       timeout: 10s
       retries: 10
+
+  # One-shot job: creates 'orders' and 'orders-dlq' with 3 partitions so
+  # the consumer-group / rebalance / partition-assignment demo has
+  # something to distribute, even on a single broker. Re-run with
+  # `docker compose up kafka-init` if you ever need to recreate the topics.
+  kafka-init:
+    image: confluentinc/cp-kafka:7.6.1
+    depends_on:
+      broker:
+        condition: service_healthy
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+        kafka-topics --bootstrap-server broker:29092 --create --if-not-exists \
+          --topic orders --partitions 3 --replication-factor 1
+        kafka-topics --bootstrap-server broker:29092 --create --if-not-exists \
+          --topic orders-dlq --partitions 3 --replication-factor 1
+        echo "Topics ready:"
+        kafka-topics --bootstrap-server broker:29092 --describe

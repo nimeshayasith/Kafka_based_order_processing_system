@@ -145,21 +145,37 @@ def send_to_dlq(dlq_producer, order, error_reason, attempts_used):
     dlq_producer.flush()
 
 
+INSTANCE_ID = os.environ.get("CONSUMER_INSTANCE_ID", f"pid-{os.getpid()}")
+
+
+def on_assign(consumer, partitions):
+    assigned = ", ".join(f"{p.topic}[{p.partition}]" for p in partitions)
+    print(f"[consumer:{INSTANCE_ID}] GROUP JOIN: assigned partitions -> {assigned or '(none)'}")
+
+
+def on_revoke(consumer, partitions):
+    revoked = ", ".join(f"{p.topic}[{p.partition}]" for p in partitions)
+    print(f"[consumer:{INSTANCE_ID}] REBALANCE: partitions revoked -> {revoked or '(none)'}")
+
+
 def main():
     consumer = build_consumer()
     dlq_producer = build_dlq_producer()
-    consumer.subscribe([ORDERS_TOPIC])
+    # on_assign/on_revoke fire every time the consumer group coordinator
+    # (re)assigns partitions -- on first join, and again whenever a
+    # consumer joins/leaves the group and the group rebalances.
+    consumer.subscribe([ORDERS_TOPIC], on_assign=on_assign, on_revoke=on_revoke)
 
     running_avg = RunningAverage()
 
-    print(f"[consumer] subscribed to '{ORDERS_TOPIC}', max_retries={MAX_RETRIES}")
+    print(f"[consumer:{INSTANCE_ID}] subscribing to '{ORDERS_TOPIC}', max_retries={MAX_RETRIES}")
     try:
         while True:
             msg = consumer.poll(1.0)
             if msg is None:
                 continue
             if msg.error():
-                print(f"[consumer] consumer error: {msg.error()}")
+                print(f"[consumer:{INSTANCE_ID}] consumer error: {msg.error()}")
                 continue
 
             order = msg.value()
@@ -167,23 +183,25 @@ def main():
                 consumer.commit(message=msg)
                 continue
 
+            partition_tag = f"{msg.topic()}[{msg.partition()}]@{msg.offset()}"
             success, error_reason, attempts_used = handle_with_retry(order)
 
             if success:
                 avg = running_avg.update(order["price"])
                 print(
-                    f"[consumer] processed order {order['orderId']} product={order['product']} "
-                    f"price={order['price']:.2f} | running_avg={avg:.2f} (n={running_avg.count})"
+                    f"[consumer:{INSTANCE_ID}] {partition_tag} processed order {order['orderId']} "
+                    f"product={order['product']} price={order['price']:.2f} | "
+                    f"running_avg={avg:.2f} (n={running_avg.count})"
                 )
             else:
-                print(f"[consumer] retries exhausted for order {order['orderId']}: {error_reason}")
+                print(f"[consumer:{INSTANCE_ID}] {partition_tag} retries exhausted for order {order['orderId']}: {error_reason}")
                 send_to_dlq(dlq_producer, order, error_reason, attempts_used)
 
             # Commit only after success or after the message has safely
             # landed in the DLQ, so nothing is lost or duplicated.
             consumer.commit(message=msg)
     except KeyboardInterrupt:
-        print("[consumer] interrupted, shutting down...")
+        print(f"[consumer:{INSTANCE_ID}] interrupted, shutting down...")
     finally:
         consumer.close()
 

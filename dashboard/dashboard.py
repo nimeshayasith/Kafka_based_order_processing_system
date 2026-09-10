@@ -23,7 +23,9 @@ from flask import Flask, jsonify, render_template_string
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "producer"))
 from producer import build_producer, delivery_report, TOPIC as ORDERS_TOPIC  # noqa: E402
 
-from confluent_kafka import DeserializingConsumer
+from confluent_kafka import Consumer, DeserializingConsumer, TopicPartition
+from confluent_kafka._model import ConsumerGroupTopicPartitions
+from confluent_kafka.admin import AdminClient
 from confluent_kafka.schema_registry import SchemaRegistryClient
 from confluent_kafka.schema_registry.avro import AvroDeserializer
 from confluent_kafka.serialization import StringDeserializer
@@ -31,6 +33,7 @@ from confluent_kafka.serialization import StringDeserializer
 BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 SCHEMA_REGISTRY_URL = os.environ.get("SCHEMA_REGISTRY_URL", "http://localhost:8081")
 DLQ_TOPIC = "orders-dlq"
+MAIN_CONSUMER_GROUP = "order-consumer-group"
 SCHEMA_DIR = os.path.join(os.path.dirname(__file__), "..", "schemas")
 
 TRIGGER_PRODUCTS = {
@@ -43,6 +46,7 @@ state_lock = threading.Lock()
 state = {
     "orders": {"count": 0, "total": 0.0, "avg": 0.0, "recent": deque(maxlen=20), "history": deque(maxlen=60)},
     "dlq": {"count": 0, "recent": deque(maxlen=20)},
+    "cluster": {"brokers": [], "topics": {}, "consumer_group": {"state": "Unknown", "members": []}},
 }
 
 
@@ -121,6 +125,96 @@ def dlq_watch_loop():
             )
 
 
+def _topic_partition_info(admin, topic_names, timeout=5):
+    """Leader broker + replica set + in-sync-replica set per partition --
+    this is what makes a Kafka cluster different from a plain queue: each
+    partition has a single leader broker (handling all reads/writes for
+    it) and followers replicating it, so the cluster survives a broker
+    going down."""
+    metadata = admin.list_topics(timeout=timeout)
+    topics = {}
+    for name in topic_names:
+        topic_meta = metadata.topics.get(name)
+        if topic_meta is None or topic_meta.error is not None:
+            topics[name] = []
+            continue
+        partitions = []
+        for pid, pmeta in sorted(topic_meta.partitions.items()):
+            partitions.append(
+                {
+                    "partition": pid,
+                    "leader": pmeta.leader,
+                    "replicas": list(pmeta.replicas),
+                    "isr": list(pmeta.isrs),
+                }
+            )
+        topics[name] = partitions
+    return topics
+
+
+def _consumer_group_info(admin, group_id, timeout=5):
+    """Which broker/consumer instance owns which partition right now, and
+    how far behind (lag) each partition is -- this is the 'how does a
+    consumer enroll' picture: the group coordinator assigns partitions to
+    whichever consumer processes are currently in the group, and
+    reassigns them (a rebalance) whenever one joins or leaves."""
+    try:
+        desc_futures = admin.describe_consumer_groups([group_id], request_timeout=timeout)
+        group_desc = desc_futures[group_id].result()
+    except Exception as e:
+        return {"state": f"unavailable ({e})", "members": [], "total_lag": None}
+
+    members = []
+    for m in group_desc.members:
+        assigned = [
+            {"topic": tp.topic, "partition": tp.partition}
+            for tp in (m.assignment.topic_partitions if m.assignment else [])
+        ]
+        members.append({"client_id": m.client_id, "host": m.host, "assigned": assigned})
+
+    total_lag = None
+    try:
+        offsets_future = admin.list_consumer_group_offsets(
+            [ConsumerGroupTopicPartitions(group_id)], request_timeout=timeout
+        )
+        committed = offsets_future[group_id].result()
+        watermark_consumer = Consumer(
+            {"bootstrap.servers": BOOTSTRAP_SERVERS, "group.id": "dashboard-watermark-probe"}
+        )
+        total_lag = 0
+        for tp in committed.topic_partitions:
+            if tp.offset is None or tp.offset < 0:
+                continue
+            low, high = watermark_consumer.get_watermark_offsets(
+                TopicPartition(tp.topic, tp.partition), timeout=timeout, cached=False
+            )
+            total_lag += max(0, high - tp.offset)
+        watermark_consumer.close()
+    except Exception:
+        total_lag = None
+
+    return {"state": str(group_desc.state), "members": members, "total_lag": total_lag}
+
+
+def cluster_watch_loop():
+    admin = AdminClient({"bootstrap.servers": BOOTSTRAP_SERVERS})
+    while True:
+        try:
+            metadata = admin.list_topics(timeout=5)
+            brokers = sorted(
+                [{"id": b.id, "host": b.host, "port": b.port} for b in metadata.brokers.values()],
+                key=lambda b: b["id"],
+            )
+            topics = _topic_partition_info(admin, [ORDERS_TOPIC, DLQ_TOPIC])
+            group = _consumer_group_info(admin, MAIN_CONSUMER_GROUP)
+
+            with state_lock:
+                state["cluster"] = {"brokers": brokers, "topics": topics, "consumer_group": group}
+        except Exception as e:
+            print(f"[dashboard] cluster watch error: {e}")
+        time.sleep(3)
+
+
 @app.route("/api/state")
 def api_state():
     with state_lock:
@@ -135,6 +229,7 @@ def api_state():
                     "history": list(o["history"]),
                 },
                 "dlq": {"count": d["count"], "recent": list(d["recent"])},
+                "cluster": state["cluster"],
             }
         )
 
@@ -217,6 +312,29 @@ PAGE = """
         <tbody id="dlq-body"></tbody>
       </table>
     </div>
+
+    <div class="card">
+      <div class="label">Cluster Topology — Partitions &amp; Replicas</div>
+      <p style="font-size:12px;color:#9aa0a6;margin:4px 0">
+        Each partition has one leader broker (bold) handling reads/writes, with followers
+        replicating it. If a broker goes down, a surviving in-sync replica (ISR) takes over.
+      </p>
+      <table>
+        <thead><tr><th>Topic</th><th>Partition</th><th>Leader</th><th>Replicas</th><th>ISR</th></tr></thead>
+        <tbody id="topology-body"></tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <div class="label">Consumer Group: order-consumer-group</div>
+      <p style="font-size:12px;color:#9aa0a6;margin:4px 0">
+        State: <span id="group-state">-</span> · Total lag: <span id="group-lag">-</span>
+      </p>
+      <table>
+        <thead><tr><th>Consumer (client id)</th><th>Host</th><th>Assigned Partitions</th></tr></thead>
+        <tbody id="group-body"></tbody>
+      </table>
+    </div>
   </div>
 
 <script>
@@ -265,6 +383,22 @@ async function refresh() {
   ).join('');
 
   drawSparkline(data.orders.history);
+
+  const rows = [];
+  for (const [topic, partitions] of Object.entries(data.cluster.topics)) {
+    partitions.forEach(p => {
+      rows.push(`<tr><td>${topic}</td><td>${p.partition}</td><td><b>broker-${p.leader}</b></td>` +
+        `<td>${p.replicas.map(r => 'broker-' + r).join(', ')}</td><td>${p.isr.map(r => 'broker-' + r).join(', ')}</td></tr>`);
+    });
+  }
+  document.getElementById('topology-body').innerHTML = rows.join('');
+
+  const group = data.cluster.consumer_group;
+  document.getElementById('group-state').textContent = group.state;
+  document.getElementById('group-lag').textContent = group.total_lag === null ? 'unknown' : group.total_lag;
+  document.getElementById('group-body').innerHTML = group.members.map(m =>
+    `<tr><td>${m.client_id}</td><td>${m.host}</td><td>${m.assigned.map(a => a.topic + '[' + a.partition + ']').join(', ') || '(none)'}</td></tr>`
+  ).join('') || '<tr><td colspan="3" style="color:#9aa0a6">no active members — start consumer.py</td></tr>';
 }
 
 setInterval(refresh, 1000);
@@ -283,6 +417,7 @@ def index():
 def main():
     threading.Thread(target=orders_watch_loop, daemon=True).start()
     threading.Thread(target=dlq_watch_loop, daemon=True).start()
+    threading.Thread(target=cluster_watch_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=5000, debug=False)
 
 

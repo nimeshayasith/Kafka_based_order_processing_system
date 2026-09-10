@@ -1,0 +1,12 @@
+{
+  "type": "record",
+  "name": "OrderDLQ",
+  "fields": [
+    {"name": "orderId", "type": "string"},
+    {"name": "product", "type": "string"},
+    {"name": "price", "type": "float"},
+    {"name": "errorReason", "type": "string"},
+    {"name": "failedAtEpochMs", "type": "long"},
+    {"name": "retries", "type": "int"}
+  ]
+}
